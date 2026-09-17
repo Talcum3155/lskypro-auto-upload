@@ -1,7 +1,6 @@
 import {
   MarkdownView,
   Plugin,
-  FileSystemAdapter,
   Editor,
   Menu,
   Notice,
@@ -11,14 +10,13 @@ import {
   TFile,
 } from "obsidian";
 
-import { join, parse, basename, dirname } from "path";
+import { posix, parse } from "path";
 
 import imageType from "image-type";
 
 import {
   isAssetTypeAnImage,
   getUrlAsset,
-  arrayToObject,
 } from "./utils";
 import { LskyProUploader } from "./uploader";
 import Helper from "./helper";
@@ -38,6 +36,7 @@ export default class imageAutoUploadPlugin extends Plugin {
   editor: Editor;
   lskyUploader: LskyProUploader;
   uploader: LskyProUploader;
+  private batchRunning = false;
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -133,7 +132,7 @@ export default class imageAutoUploadPlugin extends Plugin {
             if (markdownMatch && markdownMatch.length > 1) {
               const markdownUrl = markdownMatch[1];
               if (
-                this.settings.uploadedImages.find(
+                (this.settings.uploadedImages || []).find(
                   (item: { imgUrl: string }) => item.imgUrl === markdownUrl
                 )
               ) {
@@ -148,145 +147,58 @@ export default class imageAutoUploadPlugin extends Plugin {
   }
 
   async downloadAllImageFiles() {
-    const fileArray = this.helper.getAllFiles();
-    const folderPathAbs = this.getAttachmentFolderPath();
-    if (folderPathAbs==null||!folderPathAbs) {
-      new Notice(
-      `Get attachment folder path faild.`
-      );
-      return ;
-    }
-    let absfolder = this.app.vault.getAbstractFileByPath(folderPathAbs);
-    if (!absfolder) {
-      this.app.vault.createFolder(folderPathAbs);
-    }
-
-    let imageArray = [];
-    let count:number = 0;
-    for (const file of fileArray) {
-      if (!file.path.startsWith("http")) {
-        continue;
-      }
-      count++;
-      const url = file.path;
-      const asset = getUrlAsset(url);
-      let [name, ext] = [
-        decodeURI(parse(asset).name).replaceAll(/[\\\\/:*?\"<>|]/g, "-"),
-        parse(asset).ext,
-      ];
-
-      // 如果文件名已存在，则用随机值替换
-      if (this.app.vault.getAbstractFileByPath(folderPathAbs+"/"+asset)) {
-        name = (Math.random() + 1).toString(36).substring(2, 7);
-      }
-      try {
-        const response = await this.download(url, folderPathAbs, name, ext);
-        if (response.ok) {
-          imageArray.push({
-            source: file.source,
-            name: name,
-            path: response.path,
-          });
-        }
-      } catch (error) {
-        
-      }
-
-    }
-    let value = this.helper.getValue();
-    imageArray.map(image => {
-      value = value.replace(
-        image.source,
-        `![${image.name}${this.settings.imageSizeSuffix || ""}](${encodeURI(
-          image.path
-        )})`
-      );
-    });
-
-    this.helper.setValue(value);
-
-    new Notice(
-      `all: ${count}\nsuccess: ${imageArray.length}\nfailed: ${count - imageArray.length
-      }`
-    );
-  }
-  //获取附件路径（相对路径）
-  getAttachmentFolderPath() {
-    // @ts-ignore
-    let assetFolder: string = this.app.vault.config.attachmentFolderPath;
-    if (!assetFolder) {
-      assetFolder = "/"
-    }
-    const activeFile = this.app.vault.getAbstractFileByPath(
-      this.app.workspace.getActiveFile()?.path
-    );
-    if (activeFile==null||!activeFile) {
-      return null;
-    }
-    const parentPath = activeFile.parent.path;
-    // 当前文件夹下的子文件夹
-    if (assetFolder.startsWith("./")) {
-      assetFolder = assetFolder.substring(1);
-      let pathTem = parentPath + (assetFolder==="/"?"":assetFolder);
-      while(pathTem.startsWith("/")) {
-        pathTem = pathTem.substring(1);
-      }
-      return pathTem;
-    } else {
-      return assetFolder;
-    }
-  }
-  
-  async download(url: string, folderPath: string, name: string, ext: string) {
-    const response = await requestUrl({ url });
-    const type = await imageType(new Uint8Array(response.arrayBuffer));
-
-    if (response.status !== 200) {
-      return {
-        ok: false,
-        msg: "error",
-      };
-    }
-    if (!type) {
-      return {
-        ok: false,
-        msg: "error",
-      };
-    }
-
-    const buffer = Buffer.from(response.arrayBuffer);
-
+    if (this.batchRunning) { new Notice("已有批量任务正在运行"); return; }
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
+    this.batchRunning = true;
     try {
-      let path = folderPath+'/'+`${name}${ext}`;
-
-      if (!ext) {
-        path = folderPath +'/'+ `${name}.${type.ext}`;
+      const originalPath = file.path;
+      const content = await this.helper.readFile(file);
+      const images = this.helper.getImageLink(content).filter(image => /^https?:\/\//i.test(image.path));
+      const folder = this.getAttachmentFolderPath(file);
+      if (folder && !this.app.vault.getAbstractFileByPath(folder)) await this.app.vault.createFolder(folder);
+      const downloaded = new Map<string, string>();
+      const replacements = new Map<string, string>();
+      let failed = 0;
+      for (const image of images) {
+        try {
+          let path = downloaded.get(image.path);
+          if (!path) {
+            const response = await requestUrl({ url: image.path });
+            if (response.status !== 200) throw new Error(`HTTP ${response.status}`);
+            const type = await imageType(new Uint8Array(response.arrayBuffer));
+            if (!type) throw new Error("无法识别图片格式");
+            let asset = getUrlAsset(image.path);
+            try { asset = decodeURIComponent(asset); } catch { /* Preserve malformed URL names. */ }
+            const name = parse(asset).name.replace(/[\\/:*?"<>|]/g, "-") || "image";
+            path = posix.join(folder, `${name}.${type.ext}`);
+            for (let index = 1; this.app.vault.getAbstractFileByPath(path); index++) path = posix.join(folder, `${name}-${index}.${type.ext}`);
+            await this.app.vault.createBinary(path, response.arrayBuffer);
+            downloaded.set(image.path, path);
+          }
+          replacements.set(image.source, this.imageMarkdown(image.name, encodeURI(path)));
+        } catch (error) { failed++; new Notice(`下载失败：${String(error)}`); }
       }
-      (this.app.vault as any).createBinary(path, buffer, {
-        ctime: Date.now(),
-        mtime: Date.now()
-      })
-      return {
-        ok: true,
-        msg: "ok",
-        path: path,
-        type,
-      };
-    } catch (err) {
-      console.error(err);
+      if (file.path !== originalPath) throw new Error("下载期间笔记已移动，请重试");
+      if (replacements.size) await this.helper.updateFile(file, value => this.helper.replaceLinks(value, replacements), content);
+      new Notice(`下载完成：成功 ${images.length - failed}，失败 ${failed}`);
+    } catch (error) { new Notice(`下载失败：${String(error)}`); }
+    finally { this.batchRunning = false; }
+  }
 
-      return {
-        ok: false,
-        msg: err,
-      };
-    }
+  getAttachmentFolderPath(file: TFile) {
+    const configured: string = (this.app.vault as any).config?.attachmentFolderPath || "";
+    if (configured === "." || configured === "./") return (file.parent?.path || "").replace(/^\/+|\/+$/g, "");
+    const folder = configured.startsWith("./")
+      ? posix.join(file.parent?.path || "", configured.slice(2)) : configured;
+    return folder.replace(/^\/+|\/+$/g, "");
   }
 
   filterFile(fileArray: Image[]) {
     const imageList: Image[] = [];
 
     for (const match of fileArray) {
-      if (match.path.startsWith("http")) {
+      if (/^https?:\/\//i.test(match.path)) {
         if (this.settings.workOnNetWork) {
           if (
             !this.helper.hasBlackDomain(
@@ -314,273 +226,201 @@ export default class imageAutoUploadPlugin extends Plugin {
 
     return imageList;
   }
-  getFile(fileName: string, fileMap: any) {
-    if (!fileMap) {
-      fileMap = arrayToObject(this.app.vault.getFiles(), "name");
-    }
-    return fileMap[fileName];
+  private imageMarkdown(name: string, url: string) {
+    const alt = `${name}${this.settings.imageSizeSuffix || ""}`.replace(/[\[\]\r\n]/g, " ");
+    return `![${alt}](${url.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29")})`;
   }
-  // upload all images in a specific markdown file
+
   async uploadAllFile(currentFile?: TFile) {
-    const activeFile = currentFile ?? this.app.workspace.getActiveFile();
-    if (!activeFile) {
-      new Notice("没有打开的文件");
-      return;
-    }
+    const file = currentFile ?? this.app.workspace.getActiveFile();
+    if (!file) { new Notice("没有打开的文件"); return; }
+    await this.runUploadBatch([file]);
+  }
 
-    // 获取内容：若为当前激活文件且有编辑器，则使用编辑器内容；否则读取文件内容
-    const isActive =
-      activeFile === this.app.workspace.getActiveFile() &&
-      !!this.app.workspace.getActiveViewOfType(MarkdownView);
-    let content = isActive ? this.helper.getValue() : await this.app.vault.read(activeFile);
+  async uploadAllNotesByUploadAllFile() {
+    await this.runUploadBatch(this.app.vault.getMarkdownFiles());
+  }
 
-    const basePath = (
-      this.app.vault.adapter as FileSystemAdapter
-    ).getBasePath();
-    const fileMap = arrayToObject(this.app.vault.getFiles(), "name");
-    const filePathMap = arrayToObject(this.app.vault.getFiles(), "path");
-    let imageList: Image[] = [];
-    const fileArray = this.filterFile(this.helper.getImageLink(content));
-
-    for (const match of fileArray) {
-      const imageName = match.name;
-      const encodedUri = match.path;
-
-      if (!encodedUri.startsWith("http")) {
-        const matchPath = decodeURI(encodedUri);
-        const fileName = basename(matchPath);
-        let file;
-        // 绝对路径
-        if (filePathMap[matchPath]) {
-          file = filePathMap[matchPath];
-        }
-
-        // 相对路径
-        if (
-          (!file && matchPath.startsWith("./")) ||
-          matchPath.startsWith("../")
-        ) {
-          let absoPath = "";
-          //查找相对路径
-          if (matchPath.startsWith("./")) {
-            absoPath = dirname(activeFile.path)+matchPath.substring(1)
-          } else {
-            //对于../../开头的路径，需要向上查找匹配
-            let num = matchPath.split("../").length-1;
-            absoPath = matchPath;
-            for (let i=0;i<num;i++) {
-              absoPath = absoPath.substring(0,absoPath.lastIndexOf("/"))
-            }
-          }
-          file = this.app.vault.getAbstractFileByPath(absoPath);
-        }
-        // 尽可能短路径
-        if (!file) {
-          file = this.getFile(fileName, fileMap);
-        }
-
-        if (file) {
-          const abstractImageFile = join(basePath, file.path);
-
-          if (isAssetTypeAnImage(abstractImageFile)) {
-            let pushObj = {
-              path: abstractImageFile,
-              obspath: file.path,
-              name: file?.name || imageName,
-              source: match.source,
-            };
-            //如果文件中有重复引用的图片，只上传一次
-            if (!imageList.find(item=>item.path===abstractImageFile&&item.name===imageName&&item.source===match.source)) {
-              imageList.push(pushObj);
-            }
-          }
+  private async runUploadBatch(files: TFile[]) {
+    if (this.batchRunning) { new Notice("已有批量任务正在运行"); return; }
+    this.batchRunning = true;
+    const cache = new Map<string, string>();
+    const candidates = new Map<TFile, { mtime: number; size: number }>();
+    let success = 0, skipped = 0, failed = 0;
+    try {
+      for (const file of files) {
+        try {
+          const changed = await this.uploadNote(file, cache, candidates);
+          if (changed) success++; else skipped++;
+        } catch (error) {
+          failed++;
+          new Notice(`${file.path}：${String(error)}`);
         }
       }
-    }
-
-    if (imageList.length === 0) {
-      new Notice(`${activeFile.path}没有解析到图像文件`);
-      return;
-    } else {
-      new Notice(`${activeFile.path}共找到${imageList.length}个图像文件，开始上传`);
-    }
-
-    const res = await this.uploader.uploadFilesByPath(
-      imageList.map(item => item.obspath)
-    );
-    if (res.success) {
-      let uploadUrlList = res.result;
-      const uploadUrlFullResultList = res.fullResult || [];
-
-      this.settings.uploadedImages = [
-        ...(this.settings.uploadedImages || []),
-        ...uploadUrlFullResultList,
-      ];
-      await this.saveSettings();
-      imageList.map(item => {
-        const uploadImage = uploadUrlList.shift();
-        content = content.replaceAll(
-          item.source,
-          `![${item.name}${this.settings.imageSizeSuffix || ""}](${uploadImage})`
-        );
-      });
-      if (isActive) {
-        this.helper.setValue(content);
-      } else {
-        await this.app.vault.modify(activeFile, content);
-      }
-
-      if (this.settings.deleteSource) {
-        imageList.map(image => {
-          if (!image.path.startsWith("http")) {
-            let fileDel = this.app.vault.getAbstractFileByPath(image.obspath);
-            if (fileDel) {
-              this.app.vault.delete(fileDel);
-            }
-          }
-        });
-      }
-    } else {
-      new Notice("Upload error");
+      if (this.settings.deleteSource) await this.cleanUploadedSources(candidates);
+      new Notice(`处理完成：成功 ${success}，跳过 ${skipped}，失败 ${failed}`);
+    } catch (error) {
+      new Notice(`批量任务失败：${String(error)}`);
+    } finally {
+      this.batchRunning = false;
     }
   }
 
-  // upload images across all markdown notes by reusing uploadAllFile
-  async uploadAllNotesByUploadAllFile() {
-    const mdFiles = this.app.vault
-      .getFiles()
-      .filter(f => f.path.endsWith(".md"));
-    for (const md of mdFiles) {
-      await this.uploadAllFile(md);
+  private async uploadNote(file: TFile, cache: Map<string, string>, candidates: Map<TFile, { mtime: number; size: number }>) {
+    if (this.helper.getFrontmatterValue("image-auto-upload", true, file) === false) return false;
+    const originalPath = file.path;
+    const content = await this.helper.readFile(file);
+    const images = this.filterFile(this.helper.getImageLink(content));
+    const replacements = new Map<string, string>();
+    const localFiles = new Map<TFile, { mtime: number; size: number }>();
+    for (const image of images) {
+      const remote = /^https?:\/\//i.test(image.path);
+      const local = remote ? null : this.helper.resolveImage(image.path, file);
+      if (!remote && (!local || !isAssetTypeAnImage(local.path))) {
+        // Non-image embeds are expected; missing image references are failures.
+        if (!local && isAssetTypeAnImage(image.path)) throw new Error(`找不到图片：${image.path}`);
+        continue;
+      }
+      const snapshot = local ? { mtime: local.stat.mtime, size: local.stat.size } : null;
+      const path = local ? local.path : image.path;
+      const key = local ? JSON.stringify([path, snapshot!.mtime, snapshot!.size]) : path;
+      let url = cache.get(key);
+      if (!url) {
+        const result = await this.uploader.uploadFilesByPath([path]);
+        if (!result.success || !result.result[0]) throw new Error(result.msg || "上传失败");
+        url = result.result[0];
+        cache.set(key, url);
+      }
+      replacements.set(image.source, this.imageMarkdown(image.name || local?.name || "image", url));
+      if (local) localFiles.set(local, snapshot!);
     }
-    new Notice(`处理完成，共处理${mdFiles.length}个文件`);
+    if (!replacements.size) return false;
+    if (file.path !== originalPath) throw new Error("上传期间笔记已移动，请重试");
+    for (const [local, snapshot] of localFiles) {
+      if (local.stat.mtime !== snapshot.mtime || local.stat.size !== snapshot.size) throw new Error("上传期间源图片已修改，请重试");
+    }
+    await this.helper.updateFile(file, value => this.helper.replaceLinks(value, replacements), content);
+    for (const [local, snapshot] of localFiles) candidates.set(local, snapshot);
+    return true;
+  }
+
+  private async cleanUploadedSources(candidates: Map<TFile, { mtime: number; size: number }>) {
+    // Read actual files instead of trusting the asynchronously updated link cache.
+    // Name matches deliberately retain ambiguous references, including code and
+    // Canvas links. Saved and unsaved content must both be free of references.
+    let retained = 0;
+    for (const [image, snapshot] of candidates) {
+      if (this.app.vault.getAbstractFileByPath(image.path) !== image ||
+          image.stat.mtime !== snapshot.mtime || image.stat.size !== snapshot.size) { retained++; continue; }
+      let referenced = false;
+      for (const note of this.app.vault.getFiles().filter(file => ["md", "canvas"].includes(file.extension))) {
+        const saved = await this.app.vault.read(note);
+        const current = note.extension === "md" ? await this.helper.readFile(note) : saved;
+        const needle = image.name.toLowerCase();
+        // Decode individual escapes so malformed percent signs don't hide links.
+        const contains = (text: string) => {
+          // A successfully replaced image may retain its old filename as alt
+          // text. External image labels do not reference a local source.
+          // Resolve extensionless Wiki/Markdown links too: ![[image]] may
+          // reference image.png even though the filename never appears in text.
+          const links = this.helper.getImageLink(text);
+          for (const link of links) {
+            if (!/^https?:\/\//i.test(link.path) && this.helper.resolveImage(link.path, note) === image) return true;
+          }
+          for (const match of text.matchAll(/\[\[([^\]|#\n]+)(?:[^\]\n]*)\]\]/g)) {
+            if (this.helper.resolveImage(match[1], note) === image) return true;
+          }
+          // Cached ordinary links are an additional conservative guard. Stale
+          // entries can retain a file, but cannot authorize deleting one.
+          if (this.app.metadataCache.resolvedLinks?.[note.path]?.[image.path]) return true;
+          const remoteImages = links.filter(link => /^https?:\/\//i.test(link.path));
+          text = this.helper.replaceLinks(text, new Map(remoteImages.map(link => [link.source, ""])));
+          let decoded = text;
+          try { decoded = decodeURIComponent(text); } catch {
+            decoded = text.replace(/(?:%[0-9a-f]{2})+/gi, part => { try { return decodeURIComponent(part); } catch { return part; } });
+          }
+          return decoded.toLowerCase().includes(needle) || text.includes(encodeURIComponent(image.name));
+        };
+        if (contains(saved) || contains(current)) { referenced = true; break; }
+      }
+      if (referenced) { retained++; continue; }
+      // Recheck after asynchronous reads; modified originals must never be removed.
+      if (this.app.vault.getAbstractFileByPath(image.path) !== image || image.stat.mtime !== snapshot.mtime || image.stat.size !== snapshot.size) { retained++; continue; }
+      await this.app.vault.trash(image, false);
+    }
+    if (retained) new Notice(`保留 ${retained} 张仍被引用、尚未保存替换结果或已修改的源图片`);
   }
 
   setupPasteHandler() {
-    this.registerEvent(
-      this.app.workspace.on(
-        "editor-paste",
-        (evt: ClipboardEvent, editor: Editor, markdownView: MarkdownView) => {
-          const allowUpload = this.helper.getFrontmatterValue(
-            "image-auto-upload",
-            this.settings.uploadByClipSwitch
-          );
-
-          let files = evt.clipboardData.files;
-          if (!allowUpload) {
-            return;
-          }
-          // 剪贴板内容有md格式的图片时
-          if (this.settings.workOnNetWork) {
-            const clipboardValue = evt.clipboardData.getData("text/plain");
-            const imageList = this.helper
-              .getImageLink(clipboardValue)
-              .filter(image => image.path.startsWith("http"))
-              .filter(
-                image =>
-                  !this.helper.hasBlackDomain(
-                    image.path,
-                    this.settings.newWorkBlackDomains
-                  )
-              );
-
-            if (imageList.length !== 0) {
-              this.uploader
-                .uploadFilesByPath(imageList.map(item => item.path))
-                .then(res => {
-                  let value = this.helper.getValue();
-                  if (res.success) {
-                    let uploadUrlList = res.result;
-                    imageList.map(item => {
-                      const uploadImage = uploadUrlList.shift();
-                      value = value.replaceAll(
-                        item.source,
-                        `![${item.name}${this.settings.imageSizeSuffix || ""
-                        }](${uploadImage})`
-                      );
-                    });
-                    this.helper.setValue(value);
-                    const uploadUrlFullResultList = res.fullResult || [];
-                    this.settings.uploadedImages = [
-                      ...(this.settings.uploadedImages || []),
-                      ...uploadUrlFullResultList,
-                    ];
-                    this.saveSettings();
-                  } else {
-                    new Notice("Upload error");
-                  }
-                });
-            }
-          }
-
-          // 剪贴板中是图片时进行上传
-          if (this.canUpload(evt.clipboardData)) {
-            this.uploadFileAndEmbedImgurImage(
-              editor,
-              async (editor: Editor, pasteId: string) => {
-                let res = await this.uploader.uploadFileByClipboard(evt);
-                if (res.code !== 0) {
-                  this.handleFailedUpload(editor, pasteId, res.msg);
-                  return;
-                }
-                const url = res.data;
-                const uploadUrlFullResultList = res.fullResult || [];
-                this.settings.uploadedImages = [
-                  ...(this.settings.uploadedImages || []),
-                  ...uploadUrlFullResultList,
-                ];
-                await this.saveSettings();
-                return url;
-              },
-              evt.clipboardData
-            ).catch();
-            evt.preventDefault();
-          }
+    this.registerEvent(this.app.workspace.on("editor-paste", (evt: ClipboardEvent, editor: Editor, view: MarkdownView) => {
+      const data = evt.clipboardData;
+      const file = view.file;
+      if (!data || !file || evt.defaultPrevented || !this.helper.getFrontmatterValue("image-auto-upload", this.settings.uploadByClipSwitch, file)) return;
+      if (this.canUpload(data)) {
+        const files = Array.from(data.files).filter(file => file.type.startsWith("image/"));
+        evt.preventDefault();
+        void this.uploadAndInsert(file, editor, files);
+        return;
+      }
+      if (!this.settings.workOnNetWork) return;
+      const text = data.getData("text/plain");
+      const images = this.helper.getImageLink(text).filter(image => /^https?:\/\//i.test(image.path) && !this.helper.hasBlackDomain(image.path, this.settings.newWorkBlackDomains));
+      if (!images.length) return;
+      evt.preventDefault();
+      const marker = this.newMarker();
+      editor.replaceSelection(marker);
+      void (async () => {
+        let replacement = text;
+        try {
+          const paths = [...new Set(images.map(image => image.path))];
+          const result = await this.uploader.uploadFilesByPath(paths);
+          if (!result.success) throw new Error(result.msg || "上传失败");
+          const urls = new Map(paths.map((path, index) => [path, result.result[index]]));
+          replacement = this.helper.replaceLinks(text, new Map(images.map(image => [image.source, this.imageMarkdown(image.name, urls.get(image.path)!)])));
+        } catch (error) {
+          new Notice(`上传失败，保留原始链接：${String(error)}`);
         }
-      )
-    );
-    this.registerEvent(
-      this.app.workspace.on(
-        "editor-drop",
-        async (evt: DragEvent, editor: Editor, markdownView: MarkdownView) => {
-          const allowUpload = this.helper.getFrontmatterValue(
-            "image-auto-upload",
-            this.settings.uploadByClipSwitch
-          );
-          let files = evt.dataTransfer.files;
-          if (!allowUpload) {
-            return;
-          }
+        try { await this.replaceMarker(file, marker, replacement); }
+        catch (error) { new Notice(`粘贴内容写回失败：${String(error)}`); }
+      })();
+    }));
+    this.registerEvent(this.app.workspace.on("editor-drop", (evt: DragEvent, editor: Editor, view: MarkdownView) => {
+      const files = Array.from(evt.dataTransfer?.files ?? []);
+      const file = view.file;
+      if (!file || evt.defaultPrevented || !files.length || !files.every(item => item.type.startsWith("image/")) ||
+          !this.helper.getFrontmatterValue("image-auto-upload", this.settings.uploadByClipSwitch, file)) return;
+      evt.preventDefault();
+      void this.uploadAndInsert(file, editor, files);
+    }));
+  }
 
-          if (files.length !== 0 && files[0].type.startsWith("image")) {
-            let files = evt.dataTransfer.files;
-            evt.preventDefault();
+  private newMarker() { return `![Uploading file...${crypto.randomUUID()}]()`; }
 
-            const data = await this.uploader.uploadFiles(Array.from(files));
+  private async replaceMarker(file: TFile, marker: string, replacement: string) {
+    await this.helper.updateFile(file, text => text.replace(marker, () => replacement));
+  }
 
-            if (data.success) {
-              const uploadUrlFullResultList = data.fullResult ?? [];
-              this.settings.uploadedImages = [
-                ...(this.settings.uploadedImages ?? []),
-                ...uploadUrlFullResultList,
-              ];
-              this.saveSettings();
-              data.result.map((value: string) => {
-                let pasteId = (Math.random() + 1).toString(36).substring(2, 7);
-                this.insertTemporaryText(editor, pasteId);
-                this.embedMarkDownImage(editor, pasteId, value, files[0].name);
-              });
-            } else {
-              new Notice("Upload error");
-            }
-          }
-        }
-      )
-    );
+  private async uploadAndInsert(note: TFile, editor: Editor, files: File[]) {
+    // Insert placeholders before awaiting requests so cursor movement cannot
+    // change the destination. Each dropped image retains its own filename.
+    const markers = files.map(() => this.newMarker());
+    editor.replaceSelection(markers.join("\n") + "\n");
+    for (let index = 0; index < files.length; index++) {
+      let result;
+      try { result = await this.uploader.promiseRequest(files[index]); }
+      catch (error) { result = { code: -1, data: "", msg: String(error) }; }
+      try {
+        await this.replaceMarker(note, markers[index], result.code === 0
+          ? this.imageMarkdown(files[index].name, result.data)
+          : "⚠️ 图片上传失败，请重新粘贴或拖拽");
+      } catch (error) {
+        new Notice(`图片链接写回失败：${String(error)}`);
+      }
+      if (result.code !== 0) new Notice(result.msg);
+    }
   }
 
   canUpload(clipboardData: DataTransfer) {
-    this.settings.applyImage;
     const files = clipboardData.files;
     const text = clipboardData.getData("text");
 
@@ -597,73 +437,4 @@ export default class imageAutoUploadPlugin extends Plugin {
     }
   }
 
-  async uploadFileAndEmbedImgurImage(
-    editor: Editor,
-    callback: Function,
-    clipboardData: DataTransfer
-  ) {
-    let pasteId = (Math.random() + 1).toString(36).substring(2, 7);
-    this.insertTemporaryText(editor, pasteId);
-    const name = clipboardData.files[0].name;
-    try {
-      const url = await callback(editor, pasteId);
-      this.embedMarkDownImage(editor, pasteId, url, name);
-    } catch (e) {
-      this.handleFailedUpload(editor, pasteId, e);
-    }
-  }
-
-  insertTemporaryText(editor: Editor, pasteId: string) {
-    let progressText = imageAutoUploadPlugin.progressTextFor(pasteId);
-    editor.replaceSelection(progressText + "\n");
-  }
-
-  private static progressTextFor(id: string) {
-    return `![Uploading file...${id}]()`;
-  }
-
-  embedMarkDownImage(
-    editor: Editor,
-    pasteId: string,
-    imageUrl: any,
-    name: string = ""
-  ) {
-    let progressText = imageAutoUploadPlugin.progressTextFor(pasteId);
-    const imageSizeSuffix = this.settings.imageSizeSuffix || "";
-    let markDownImage = `![${name}${imageSizeSuffix}](${imageUrl})`;
-
-    imageAutoUploadPlugin.replaceFirstOccurrence(
-      editor,
-      progressText,
-      markDownImage
-    );
-  }
-
-  handleFailedUpload(editor: Editor, pasteId: string, reason: any) {
-    new Notice(reason);
-    console.error("Failed request: ", reason);
-    let progressText = imageAutoUploadPlugin.progressTextFor(pasteId);
-    imageAutoUploadPlugin.replaceFirstOccurrence(
-      editor,
-      progressText,
-      "⚠️upload failed, check dev console"
-    );
-  }
-
-  static replaceFirstOccurrence(
-    editor: Editor,
-    target: string,
-    replacement: string
-  ) {
-    let lines = editor.getValue().split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      let ch = lines[i].indexOf(target);
-      if (ch != -1) {
-        let from = { line: i, ch: ch };
-        let to = { line: i, ch: ch + target.length };
-        editor.replaceRange(replacement, from, to);
-        break;
-      }
-    }
-  }
 }

@@ -14,6 +14,10 @@ export interface PluginSettings {
   fixPath: boolean;
   applyImage: boolean;
   deleteSource: boolean;
+  compressImages: boolean;
+  compressionQuality: number;
+  compressionMaxDimension: number;
+  compressionMinKB: number;
   [propName: string]: any;
 }
 
@@ -29,6 +33,10 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   applyImage: true,
   newWorkBlackDomains: "",
   deleteSource: false,
+  compressImages: true,
+  compressionQuality: 0.85,
+  compressionMaxDimension: 0,
+  compressionMinKB: 256,
 };
 
 export class SettingTab extends PluginSettingTab {
@@ -110,6 +118,46 @@ export class SettingTab extends PluginSettingTab {
         );
     }
 
+
+    new Setting(containerEl)
+      .setName("上传前压缩图片")
+      .setDesc("将较大的静态 PNG、JPEG、BMP 转为 WebP，保留透明背景。仅在文件变小时使用压缩结果；不修改本地原图。图床需支持 WebP。")
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.compressImages)
+        .onChange(async value => {
+          this.plugin.settings.compressImages = value;
+          await this.plugin.saveSettings();
+        }));
+    new Setting(containerEl)
+      .setName("压缩质量")
+      .setDesc("默认 85%。数值越高越清晰，体积也越大。文字截图建议 85%–95%。")
+      .addSlider(slider => slider.setLimits(10, 100, 5)
+        .setValue(Math.round(this.plugin.settings.compressionQuality * 100))
+        .setDynamicTooltip().onChange(async value => {
+          this.plugin.settings.compressionQuality = value / 100;
+          await this.plugin.saveSettings();
+        }));
+    new Setting(containerEl)
+      .setName("图片最长边（像素）")
+      .setDesc("0 表示保留原始分辨率（默认）。例如 2560：超出时等比例缩小，不裁剪、不放大。长截图建议保留原始分辨率。")
+      .addText(text => text.setValue(String(this.plugin.settings.compressionMaxDimension))
+        .onChange(async value => {
+          if (!/^\d+$/.test(value.trim())) return;
+          const size = Number(value);
+          if (!Number.isSafeInteger(size) || (size !== 0 && size < 256)) return;
+          this.plugin.settings.compressionMaxDimension = size;
+          await this.plugin.saveSettings();
+        }));
+    new Setting(containerEl)
+      .setName("压缩起始大小（KB）")
+      .setDesc("默认 256 KB，小于此大小的图片直接上传。0 表示所有支持的图片都尝试压缩。")
+      .addText(text => text.setValue(String(this.plugin.settings.compressionMinKB))
+        .onChange(async value => {
+          if (!/^\d+$/.test(value.trim())) return;
+          const size = Number(value);
+          if (!Number.isSafeInteger(size)) return;
+          this.plugin.settings.compressionMinKB = size;
+          await this.plugin.saveSettings();
+        }));
 
     new Setting(containerEl)
       .setName(t("Image size suffix"))

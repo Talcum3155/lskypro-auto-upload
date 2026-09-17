@@ -1,135 +1,119 @@
-import { PluginSettings } from "./setting";
+import { compressImage } from "./compression";
+import type { PluginSettings } from "./setting";
 import { App, TFile } from "obsidian";
-//兰空上传器
+
+export interface UploadResult {
+  code: number;
+  msg: string;
+  data: string;
+}
+export interface BatchUploadResult {
+  success: boolean;
+  result: string[];
+  msg?: string;
+}
+
 export class LskyProUploader {
-  settings: PluginSettings;
-  lskyUrl: string;
-  lskyToken: string;
-  app: App;
+  constructor(public settings: PluginSettings, public app: App) {}
 
-  constructor(settings: PluginSettings,app: App) {
-    this.settings = settings;
-    this.lskyUrl = this.settings.uploadServer.endsWith("/")
-      ? this.settings.uploadServer + "api/v1/upload"
-      : this.settings.uploadServer + "/api/v1/upload";
-    this.lskyToken = "Bearer " + this.settings.token;
-    this.app = app;
-  }
-
-  //上传请求配置
-  getRequestOptions(file: File) {
-    let headers = new Headers();
-    headers.append("Authorization", this.lskyToken);
-    headers.append("Accept", "application/json");
-
-    let formdata = new FormData();
-    formdata.append("file", file);
-    if (this.settings.strategy_id) {
-      formdata.append("strategy_id", this.settings.strategy_id);
+  // Read current settings for each request, including changes made after startup.
+  get lskyUrl() {
+    const server = this.settings.uploadServer.trim().replace(/\/+$/, "");
+    const url = new URL(server);
+    if (!/^https?:$/.test(url.protocol) || url.search || url.hash) {
+      throw new Error("请填写有效的 HTTP/HTTPS 图床地址");
     }
+    return `${server}/api/v1/upload`;
+  }
 
-    return {
-      method: "POST",
-      headers: headers,
-      body: formdata,
-    };
+  get lskyToken() {
+    const token = this.settings.token.trim().replace(/^Bearer\s+/i, "");
+    if (!token) throw new Error("请先配置图床 Token");
+    return `Bearer ${token}`;
   }
-  //上传文件，返回promise对象
-  promiseRequest(file: File) {
-    let requestOptions = this.getRequestOptions(file);
-    return new Promise(resolve => {
-      fetch(this.lskyUrl, requestOptions).then(response => {
-        response.json().then(value => {
-          if (!value.status) {
-            return resolve({
-              code: -1,
-              msg: value.message,
-              data: value.data,
-            });
-          } else {
-            return resolve({
-              code: 0,
-              msg: "success",
-              data: value.data?.links?.url,
-              fullResult: [],
-            });
-          }
-        });
+
+  getRequestOptions(file: File): RequestInit {
+    const headers = new Headers({ Authorization: this.lskyToken, Accept: "application/json" });
+    const body = new FormData();
+    body.append("file", file);
+    if (this.settings.strategy_id) body.append("strategy_id", this.settings.strategy_id);
+    return { method: "POST", headers, body };
+  }
+
+  // Keep the timeout active until the response body has also been consumed.
+  private async request<T>(url: string, options: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (!response.ok) throw new Error(`请求失败：HTTP ${response.status}`);
+      return await read(response);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async promiseRequest(file: File): Promise<UploadResult> {
+    try {
+      try {
+        file = await compressImage(file, this.settings);
+      } catch {
+        console.warn("Image compression failed; uploading original");
+      }
+      return await this.request(this.lskyUrl, this.getRequestOptions(file), async response => {
+        const value = await response.json();
+        const url = value?.data?.links?.url;
+        if (value?.status !== true || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+          throw new Error(String(value?.message || "图床未返回有效的图片链接"));
+        }
+        const normalized = new URL(url);
+        return { code: 0, msg: "success", data: normalized.href };
       });
-    }).catch(error => {
-      console.log("error", error);
-      return {
-        code: -1,
-        msg: error,
-        data: "",
-      };
-    });
+    } catch (error) {
+      return { code: -1, msg: String(error), data: "" };
+    }
   }
-  //通过路径创建文件
+
   async createFileObjectFromPath(path: string): Promise<File> {
-    return new Promise<File>(resolve => {
-      if(path.startsWith('https://') || path.startsWith('http://')){
-        return fetch(path).then(response => {
-          return response.blob().then(blob => {
-            resolve(new File([blob], path.split("/").pop()));
-          });
-        });
-      }
-      let obsfile = this.app.vault.getAbstractFileByPath(path);
-      //@ts-ignore
-      this.app.vault.readBinary(obsfile).then(data=>{
-        const fileName = path.split("/").pop(); // 获取文件名
-        const fileExtension = fileName.split(".").pop(); // 获取后缀名
-        const blob = new Blob([data], { type: "image/" + fileExtension });
-        const file = new File([blob], fileName);
-        resolve(file);
-      }).catch(err=>{
-        console.error("Error reading file:", err);
-        return;
+    if (/^https?:\/\//i.test(path)) {
+      return this.request(path, {}, async response => {
+        const blob = await response.blob();
+        if (!blob.size || !blob.type.startsWith("image/")) throw new Error("链接未返回有效的图片");
+        const name = new URL(path).pathname.split("/").pop() || "image";
+        return new File([blob], name, { type: blob.type });
       });
-    });
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) throw new Error(`图片不存在：${path}`);
+    const data = await this.app.vault.readBinary(file);
+    if (!data.byteLength) throw new Error(`图片为空：${path}`);
+    const ext = file.extension.toLowerCase();
+    const type = ({ jpg: "image/jpeg", jpeg: "image/jpeg", svg: "image/svg+xml", tif: "image/tiff" } as Record<string, string>)[ext] || `image/${ext}`;
+    return new File([data], file.name, { type });
   }
 
-  async uploadFilesByPath(fileList: string[]): Promise<any> {
-    let promiseArr = fileList.map(async (filepath: string) => {
-      let file = await this.createFileObjectFromPath(filepath);
-      return this.promiseRequest(file);
-    });
+  // Sequential uploads bound memory use during decoding/compression. A failed
+  // batch never returns a shortened URL array that could corrupt link mapping.
+  private async uploadBatch(files: Array<File | string>): Promise<BatchUploadResult> {
+    const result: string[] = [];
     try {
-      let reurnObj = await Promise.all(promiseArr);
-      return {
-        result: reurnObj.map((item: { data: string }) => item.data),
-        success: true,
-      };
-    } catch (error) {
-      return {
-        success: false,
-      };
-    }
-  }
-  async uploadFiles(fileList: Array<File>): Promise<any> {
-    let promiseArr = fileList.map(async file => {
-      return this.promiseRequest(file);
-    });
-    try {
-      let reurnObj = await Promise.all(promiseArr);
-      let failItem:any = reurnObj.find((item: { code: number })=>item.code===-1);
-      if (failItem) {
-        throw {err:failItem.msg}
+      for (const item of files) {
+        const file = typeof item === "string" ? await this.createFileObjectFromPath(item) : item;
+        const uploaded = await this.promiseRequest(file);
+        if (uploaded.code !== 0) throw new Error(uploaded.msg);
+        result.push(uploaded.data);
       }
-      return {
-        result: reurnObj.map((item: { data: string }) => item.data),
-        success: true,
-      };
+      return { success: true, result };
     } catch (error) {
-      return {
-        success: false,
-      };
+      return { success: false, result: [], msg: String(error) };
     }
   }
-  async uploadFileByClipboard(evt: ClipboardEvent): Promise<any> {
-    let files = evt.clipboardData.files;
-    let file = files[0];
-    return this.promiseRequest(file);
+
+  uploadFilesByPath(files: string[]) { return this.uploadBatch(files); }
+  uploadFiles(files: File[]) { return this.uploadBatch(files); }
+
+  async uploadFileByClipboard(evt: ClipboardEvent): Promise<UploadResult> {
+    const file = evt.clipboardData?.files[0];
+    return file ? this.promiseRequest(file) : { code: -1, msg: "剪贴板中没有图片", data: "" };
   }
 }
