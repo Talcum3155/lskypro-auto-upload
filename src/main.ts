@@ -227,7 +227,9 @@ export default class imageAutoUploadPlugin extends Plugin {
     return imageList;
   }
   private imageMarkdown(name: string, url: string) {
-    const alt = `${name}${this.settings.imageSizeSuffix || ""}`.replace(/[\[\]\r\n]/g, " ");
+    // Keep Obsidian sizing syntax, but omit filenames and descriptive alt text.
+    const size = this.settings.imageSizeSuffix || /\|\d+(?:x\d+)?$/.exec(name)?.[0] || "";
+    const alt = size.replace(/[\[\]\r\n]/g, " ");
     return `![${alt}](${url.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29")})`;
   }
 
@@ -402,7 +404,7 @@ export default class imageAutoUploadPlugin extends Plugin {
 
   private async uploadAndInsert(note: TFile, editor: Editor, files: File[]) {
     // Insert placeholders before awaiting requests so cursor movement cannot
-    // change the destination. Each dropped image retains its own filename.
+    // change the destination. Each result replaces its own placeholder.
     const markers = files.map(() => this.newMarker());
     editor.replaceSelection(markers.join("\n") + "\n");
     for (let index = 0; index < files.length; index++) {

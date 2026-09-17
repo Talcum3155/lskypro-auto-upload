@@ -199,7 +199,7 @@ test('network images are uploaded when enabled and blacklisted ones stay unchang
   assert.ok(note.content.includes('https://img.test/uploaded.webp')); assert.ok(note.content.includes('https://skip.test/a.png'));
 });
 
-test('multi-image insertion keeps filenames and position after switching tabs and editing', async () => {
+test('multi-image insertion keeps order and position with empty alt text after switching tabs and editing', async () => {
   const a = new TFile('a.md', 'before\n'); const b = new TFile('b.md', 'other');
   const original = new MarkdownView(a); const other = new MarkdownView(b);
   const { plugin, views } = setup([a, b], [original]);
@@ -209,7 +209,7 @@ test('multi-image insertion keeps filenames and position after switching tabs an
   original.editor.setValue(original.editor.getValue() + 'new user text');
   views.unshift(other);
   release({ code: 0, data: 'https://img.test/one.webp' }); await pending;
-  assert.equal(original.editor.getValue(), 'before\n![one.png](https://img.test/one.webp)\n![two.png](https://img.test/two.webp)\nnew user text');
+  assert.equal(original.editor.getValue(), 'before\n![](https://img.test/one.webp)\n![](https://img.test/two.webp)\nnew user text');
   assert.equal(other.editor.getValue(), 'other');
 });
 test('closing original note writes only its saved marker; undo does not reinsert image', async () => {
@@ -220,7 +220,7 @@ test('closing original note writes only its saved marker; undo does not reinsert
     const pending = plugin.uploadAndInsert(a, view.editor, [new File(['a'], 'one.png')]);
     a.content = undo ? '' : view.editor.getValue(); views[0] = new MarkdownView(b);
     release({ code: 0, data: 'https://img.test/one.webp' }); await pending;
-    assert.equal(a.content, undo ? '' : '![one.png](https://img.test/one.webp)\n');
+    assert.equal(a.content, undo ? '' : '![](https://img.test/one.webp)\n');
     assert.equal(views[0].editor.getValue(), 'other');
   }
 });
@@ -288,4 +288,28 @@ test('extensionless Wiki references in skipped notes protect shared sources', as
   app.metadataCache.getFirstLinkpathDest = link => ['image', 'image.png'].includes(link) ? image : null;
   await plugin.uploadAllFile(a);
   assert.ok(files.includes(image)); assert.equal(b.content, '![[image]]');
+});
+
+
+test('multipart upload names use local time and random suffix with final image format', async t => {
+  const date = new Date(2026, 8, 17, 21, 30, 45);
+  t.mock.timers.enable({ apis: ['Date'], now: date.getTime() });
+  const uploader = new Uploader(settings(), setup().app);
+  const source = new File(['pixels'], 'private-note-title.png', { type: 'image/webp' });
+  const first = uploader.getRequestOptions(source).body.get('file');
+  const second = uploader.getRequestOptions(source).body.get('file');
+  assert.match(first.name, /^20260917-213045-[a-f0-9]{4}\.webp$/);
+  assert.notEqual(first.name, second.name);
+  assert.equal(first.type, 'image/webp');
+  assert.equal(await first.text(), 'pixels');
+  assert.equal(source.name, 'private-note-title.png');
+  const png = uploader.getRequestOptions(new File(['png'], 'image.png', { type: 'image/png' })).body.get('file');
+  assert.match(png.name, /\.png$/);
+});
+test('Markdown omits alt text while preserving configured and existing image dimensions', () => {
+  const { plugin } = setup();
+  assert.equal(plugin.imageMarkdown('image.png', 'https://img.test/a.webp'), '![](https://img.test/a.webp)');
+  assert.equal(plugin.imageMarkdown('diagram.png|300x200', 'https://img.test/a.webp'), '![|300x200](https://img.test/a.webp)');
+  plugin.settings.imageSizeSuffix = '|600';
+  assert.equal(plugin.imageMarkdown('diagram.png|300', 'https://img.test/a.webp'), '![|600](https://img.test/a.webp)');
 });

@@ -16,6 +16,29 @@ export interface BatchUploadResult {
 export class LskyProUploader {
   constructor(public settings: PluginSettings, public app: App) {}
 
+  private filenameTimestamp = "";
+  private filenameSuffixes = new Set<string>();
+
+  private uploadFilename(file: File): string {
+    const date = new Date();
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const timestamp = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+    if (timestamp !== this.filenameTimestamp) {
+      this.filenameTimestamp = timestamp;
+      this.filenameSuffixes.clear();
+    }
+    let suffix: string;
+    do { suffix = crypto.randomUUID().slice(0, 4); } while (this.filenameSuffixes.has(suffix));
+    this.filenameSuffixes.add(suffix);
+    const mimeExtensions: Record<string, string> = {
+      "image/webp": "webp", "image/png": "png", "image/jpeg": "jpg",
+      "image/gif": "gif", "image/svg+xml": "svg", "image/bmp": "bmp",
+      "image/tiff": "tiff", "image/avif": "avif", "image/apng": "png",
+    };
+    const extension = mimeExtensions[file.type.toLowerCase()] || /\.([a-z0-9]+)$/i.exec(file.name)?.[1].toLowerCase();
+    return `${timestamp}-${suffix}${extension ? `.${extension}` : ""}`;
+  }
+
   // Read current settings for each request, including changes made after startup.
   get lskyUrl() {
     const server = this.settings.uploadServer.trim().replace(/\/+$/, "");
@@ -35,7 +58,9 @@ export class LskyProUploader {
   getRequestOptions(file: File): RequestInit {
     const headers = new Headers({ Authorization: this.lskyToken, Accept: "application/json" });
     const body = new FormData();
-    body.append("file", file);
+    // This runs after compression, so the extension matches the uploaded format.
+    // Only the multipart filename changes; the local original is untouched.
+    body.append("file", file, this.uploadFilename(file));
     if (this.settings.strategy_id) body.append("strategy_id", this.settings.strategy_id);
     return { method: "POST", headers, body };
   }
